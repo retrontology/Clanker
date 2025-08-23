@@ -454,6 +454,70 @@ LOG_LEVEL=INFO
 7. Load channel configurations and message history
 8. Start message processing loop
 
+### Graceful Shutdown Handling
+
+**Signal Handling**:
+```python
+class ApplicationManager:
+    def __init__(self):
+        self.shutdown_event = asyncio.Event()
+        self.components = []  # List of components to shutdown
+    
+    def setup_signal_handlers(self):
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        logger.info(f"Received signal {signum}, initiating graceful shutdown")
+        asyncio.create_task(self.shutdown())
+    
+    async def shutdown(self):
+        self.shutdown_event.set()
+        
+        # Shutdown components in reverse order
+        for component in reversed(self.components):
+            try:
+                await component.shutdown()
+                logger.info(f"Successfully shutdown {component.__class__.__name__}")
+            except Exception as e:
+                logger.error(f"Error shutting down {component.__class__.__name__}: {e}")
+```
+
+**Component Shutdown Interface**:
+```python
+class ShutdownMixin:
+    async def shutdown(self) -> None:
+        """Gracefully shutdown the component"""
+        pass
+
+class TwitchIRCClient(ShutdownMixin):
+    async def shutdown(self) -> None:
+        logger.info("Shutting down IRC client")
+        if self.connection:
+            await self.connection.close()
+        
+class DatabaseManager(ShutdownMixin):
+    async def shutdown(self) -> None:
+        logger.info("Shutting down database connections")
+        if self.connection_pool:
+            await self.connection_pool.close()
+        
+class OllamaClient(ShutdownMixin):
+    async def shutdown(self) -> None:
+        logger.info("Shutting down Ollama client")
+        if self.session:
+            await self.session.close()
+```
+
+**Shutdown Sequence**:
+1. Set shutdown event to stop new operations
+2. Complete any in-flight message generation
+3. Close IRC connections gracefully
+4. Flush any pending database operations
+5. Close database connections
+6. Close HTTP sessions (Ollama client)
+7. Log shutdown completion
+
 ### Production Considerations
 
 - Use connection pooling for MySQL deployments
@@ -461,7 +525,7 @@ LOG_LEVEL=INFO
 - Set up health checks for Ollama connectivity
 - Monitor memory usage and implement cleanup
 - Use systemd service for automatic restart
-- Implement graceful shutdown handling
+- Handle SIGTERM/SIGINT signals for graceful shutdown
 
 ## Security Considerations
 
