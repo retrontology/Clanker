@@ -287,9 +287,9 @@ class ConfigurationManager:
         except Exception as e:
             logger.warning(f"Could not validate model {model_name}: {e}")
             # Allow the change but warn
-            return True, f"Model {model_name} set (validation unavailable)"    
-  
-  async def _handle_status_command(self, channel: str, user_display_name: str) -> str:
+            return True, f"Model {model_name} set (validation unavailable)"
+    
+    async def _handle_status_command(self, channel: str, user_display_name: str) -> str:
         """Handle !clank status command with comprehensive system health reporting."""
         try:
             # Get channel configuration
