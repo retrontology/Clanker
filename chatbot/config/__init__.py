@@ -1,0 +1,1 @@
+"""Configuration management module for the Twitch Ollama Chatbot."""

@@ -1,0 +1,1 @@
+"""IRC handling module for Twitch integration."""

@@ -1,0 +1,36 @@
+# Core dependencies for Twitch Ollama Chatbot
+
+# Twitch IRC integration
+twitchio>=2.0.0
+
+# HTTP client for Ollama API
+aiohttp>=3.8.0
+
+# Database ORM and connection management
+sqlalchemy>=2.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Additional database drivers
+# SQLite support is built into Python
+# For MySQL support (optional)
+aiomysql>=0.2.0
+
+# Content filtering (optional - can be replaced with custom implementation)
+better-profanity>=0.7.0
+
+# Async utilities
+asyncio-mqtt>=0.13.0
+
+# Logging and monitoring
+structlog>=23.0.0
+
+# Development and testing dependencies (optional)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.10.0
+
+# Type checking (optional)
+mypy>=1.0.0
+types-python-dateutil>=2.8.0

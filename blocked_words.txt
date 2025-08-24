@@ -1,0 +1,22 @@
+# Blocked Words Configuration
+# This file contains words and phrases that should be filtered
+# from both input messages and bot-generated output
+#
+# Format:
+# - One word or phrase per line
+# - Lines starting with # are comments
+# - Empty lines are ignored
+# - Case-insensitive matching
+#
+# Categories of blocked content:
+# - Hate speech and slurs
+# - Harassment and threats
+# - Spam patterns
+# - Inappropriate content
+#
+# Note: This is a template file. Add your specific blocked words here.
+
+# Example entries (uncomment and modify as needed):
+# spam
+# hate
+# threat
