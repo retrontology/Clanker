@@ -157,6 +157,8 @@ class MessageEvent:
     content: str
     timestamp: datetime
     badges: Dict[str, str]
+    is_mention: bool = False
+    mention_content: str = ""
     
     def to_message(self) -> Message:
         """Convert to Message model for database storage."""
@@ -168,4 +170,25 @@ class MessageEvent:
             user_display_name=self.user_display_name,
             message_content=self.content,
             timestamp=self.timestamp
+        )
+    
+    @classmethod
+    def from_twitchio_message(cls, message) -> 'MessageEvent':
+        """
+        Create MessageEvent from TwitchIO message.
+        
+        Args:
+            message: TwitchIO message object
+            
+        Returns:
+            MessageEvent instance
+        """
+        return cls(
+            channel=message.channel.name,
+            user_id=str(message.author.id) if message.author.id else "unknown",
+            user_display_name=message.author.display_name or message.author.name,
+            message_id=message.id or f"msg_{datetime.now().timestamp()}",
+            content=message.content,
+            timestamp=datetime.now(),
+            badges=message.author.badges or {}
         )
