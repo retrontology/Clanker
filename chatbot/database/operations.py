@@ -372,6 +372,86 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Failed to count messages in {channel}: {e}")
             return 0
+    
+    async def execute(self, query: str, params: tuple = ()) -> Any:
+        """
+        Execute a single query with parameters.
+        
+        Args:
+            query: SQL query string
+            params: Query parameters
+            
+        Returns:
+            Query result
+        """
+        try:
+            async with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params)
+                
+                if self.db_type == 'sqlite':
+                    conn.commit()
+                
+                return cursor
+                
+        except Exception as e:
+            logger.error(f"Failed to execute query: {e}")
+            raise
+    
+    async def execute_many(self, query: str, params_list: List[tuple]) -> bool:
+        """
+        Execute a query with multiple parameter sets (batch insert).
+        
+        Args:
+            query: SQL query string
+            params_list: List of parameter tuples
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            async with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.executemany(query, params_list)
+                
+                if self.db_type == 'sqlite':
+                    conn.commit()
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to execute batch query: {e}")
+            return False
+    
+    async def fetch_all(self, query: str, params: tuple = ()) -> List[Dict[str, Any]]:
+        """
+        Fetch all results from a query.
+        
+        Args:
+            query: SQL query string
+            params: Query parameters
+            
+        Returns:
+            List of result dictionaries
+        """
+        try:
+            async with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params)
+                
+                # Get column names
+                if self.db_type == 'sqlite':
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    return [dict(zip(columns, row)) for row in rows]
+                elif self.db_type == 'mysql':
+                    columns = [description[0] for description in cursor.description]
+                    rows = cursor.fetchall()
+                    return [dict(zip(columns, row)) for row in rows]
+                
+        except Exception as e:
+            logger.error(f"Failed to fetch query results: {e}")
+            return []
 
 
 def create_database_manager(config: Dict[str, str]) -> DatabaseManager:
