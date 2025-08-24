@@ -12,10 +12,14 @@ sqlalchemy>=2.0.0
 # Environment variable management
 python-dotenv>=1.0.0
 
+# Cryptography for token encryption
+cryptography>=41.0.0
+
 # Additional database drivers
 # SQLite support is built into Python
 # For MySQL support (optional)
 aiomysql>=0.2.0
+mysql-connector-python>=8.0.0
 
 # Content filtering (optional - can be replaced with custom implementation)
 better-profanity>=0.7.0

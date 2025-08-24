@@ -15,32 +15,26 @@ from dotenv import load_dotenv
 class GlobalConfig:
     """Global configuration settings loaded from environment variables."""
     
-    # Database configuration
+    # Required fields (no defaults)
     database_type: str
     database_url: str
+    ollama_url: str
+    ollama_model: str
+    ollama_timeout: int
+    twitch_client_id: str
+    twitch_client_secret: str
+    channels: List[str]
+    content_filter_enabled: bool
+    blocked_words_file: str
+    log_level: str
+    log_format: str
+    
+    # Optional fields (with defaults)
     mysql_host: Optional[str] = None
     mysql_port: int = 3306
     mysql_user: Optional[str] = None
     mysql_password: Optional[str] = None
     mysql_database: Optional[str] = None
-    
-    # Ollama configuration
-    ollama_url: str
-    ollama_model: str
-    ollama_timeout: int
-    
-    # Twitch configuration
-    twitch_client_id: str
-    twitch_client_secret: str
-    channels: List[str]
-    
-    # Content filtering
-    content_filter_enabled: bool
-    blocked_words_file: str
-    
-    # Logging configuration
-    log_level: str
-    log_format: str
 
 
 def load_global_config() -> GlobalConfig:

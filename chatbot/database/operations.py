@@ -21,32 +21,7 @@ from .migrations import DatabaseMigrations
 logger = logging.getLogger(__name__)
 
 
-def create_database_manager(config: Dict[str, str]) -> DatabaseManager:
-    """
-    Create appropriate database manager based on configuration.
-    
-    Args:
-        config: Configuration dictionary with database settings
-        
-    Returns:
-        DatabaseManager instance
-    """
-    db_type = config.get('DATABASE_TYPE', 'sqlite').lower()
-    
-    if db_type == 'mysql':
-        return DatabaseManager(
-            db_type='mysql',
-            host=config['MYSQL_HOST'],
-            port=int(config.get('MYSQL_PORT', 3306)),
-            user=config['MYSQL_USER'],
-            password=config['MYSQL_PASSWORD'],
-            database=config['MYSQL_DATABASE']
-        )
-    else:  # Default to SQLite
-        return DatabaseManager(
-            db_type='sqlite',
-            database_url=config.get('DATABASE_URL', './chatbot.db')
-        )
+# Function moved after DatabaseManager class definition
 
 
 class DatabaseManager:
@@ -397,6 +372,34 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Failed to count messages in {channel}: {e}")
             return 0
+
+
+def create_database_manager(config: Dict[str, str]) -> DatabaseManager:
+    """
+    Create appropriate database manager based on configuration.
+    
+    Args:
+        config: Configuration dictionary with database settings
+        
+    Returns:
+        DatabaseManager instance
+    """
+    db_type = config.get('DATABASE_TYPE', 'sqlite').lower()
+    
+    if db_type == 'mysql':
+        return DatabaseManager(
+            db_type='mysql',
+            host=config['MYSQL_HOST'],
+            port=int(config.get('MYSQL_PORT', 3306)),
+            user=config['MYSQL_USER'],
+            password=config['MYSQL_PASSWORD'],
+            database=config['MYSQL_DATABASE']
+        )
+    else:  # Default to SQLite
+        return DatabaseManager(
+            db_type='sqlite',
+            database_url=config.get('DATABASE_URL', './chatbot.db')
+        )
 
 
 class ChannelConfigManager:
@@ -797,6 +800,211 @@ class ChannelConfigManager:
                 
         except Exception as e:
             logger.error(f"Failed to update user response timestamp for {user_id} in {channel}: {e}")
+            return False
+    
+    async def load_persistent_state(self, channel: str) -> None:
+        """
+        Load persistent state for a channel on startup.
+        
+        Args:
+            channel: Channel name
+        """
+        try:
+            # Load configuration to populate cache
+            await self.get_config(channel)
+            logger.info(f"Loaded persistent state for {channel}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load persistent state for {channel}: {e}")
+    
+    async def save_persistent_state(self, channel: str) -> None:
+        """
+        Save persistent state for a channel.
+        
+        Args:
+            channel: Channel name
+        """
+        try:
+            # State is automatically saved via database operations
+            # This method exists for interface completeness
+            logger.debug(f"Persistent state saved for {channel}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save persistent state for {channel}: {e}")
+
+
+class AuthTokenManager:
+    """Manages OAuth token storage and retrieval operations."""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        """
+        Initialize AuthTokenManager.
+        
+        Args:
+            db_manager: DatabaseManager instance
+        """
+        self.db_manager = db_manager
+    
+    async def store_auth_tokens(self, auth_token: AuthToken) -> bool:
+        """
+        Store authentication tokens in database.
+        
+        Args:
+            auth_token: AuthToken object to store
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # First, clear any existing tokens (only one set of tokens at a time)
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("DELETE FROM auth_tokens")
+                    cursor.execute("""
+                        INSERT INTO auth_tokens 
+                        (access_token, refresh_token, expires_at, bot_username, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        auth_token.access_token,
+                        auth_token.refresh_token,
+                        auth_token.expires_at,
+                        auth_token.bot_username,
+                        auth_token.created_at
+                    ))
+                    conn.commit()
+                    
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("DELETE FROM auth_tokens")
+                    cursor.execute("""
+                        INSERT INTO auth_tokens 
+                        (access_token, refresh_token, expires_at, bot_username, created_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        auth_token.access_token,
+                        auth_token.refresh_token,
+                        auth_token.expires_at,
+                        auth_token.bot_username,
+                        auth_token.created_at
+                    ))
+                
+                logger.info("Authentication tokens stored successfully")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to store auth tokens: {e}")
+            return False
+    
+    async def get_auth_tokens(self) -> Optional[AuthToken]:
+        """
+        Retrieve stored authentication tokens.
+        
+        Returns:
+            Optional[AuthToken]: AuthToken object or None if not found
+        """
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("""
+                        SELECT id, access_token, refresh_token, expires_at, bot_username, created_at
+                        FROM auth_tokens 
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """)
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("""
+                        SELECT id, access_token, refresh_token, expires_at, bot_username, created_at
+                        FROM auth_tokens 
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """)
+                
+                row = cursor.fetchone()
+                if row:
+                    return AuthToken.from_db_row(row)
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to retrieve auth tokens: {e}")
+            return None
+    
+    async def update_auth_tokens(self, auth_token: AuthToken) -> bool:
+        """
+        Update existing authentication tokens.
+        
+        Args:
+            auth_token: Updated AuthToken object
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("""
+                        UPDATE auth_tokens 
+                        SET access_token = ?, refresh_token = ?, expires_at = ?, 
+                            bot_username = ?, created_at = ?
+                        WHERE id = ?
+                    """, (
+                        auth_token.access_token,
+                        auth_token.refresh_token,
+                        auth_token.expires_at,
+                        auth_token.bot_username,
+                        datetime.now(),
+                        auth_token.id
+                    ))
+                    conn.commit()
+                    
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("""
+                        UPDATE auth_tokens 
+                        SET access_token = %s, refresh_token = %s, expires_at = %s, 
+                            bot_username = %s, created_at = %s
+                        WHERE id = %s
+                    """, (
+                        auth_token.access_token,
+                        auth_token.refresh_token,
+                        auth_token.expires_at,
+                        auth_token.bot_username,
+                        datetime.now(),
+                        auth_token.id
+                    ))
+                
+                logger.info("Authentication tokens updated successfully")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to update auth tokens: {e}")
+            return False
+    
+    async def delete_auth_tokens(self) -> bool:
+        """
+        Delete all stored authentication tokens.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("DELETE FROM auth_tokens")
+                    conn.commit()
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("DELETE FROM auth_tokens")
+                
+                logger.info("Authentication tokens deleted successfully")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to delete auth tokens: {e}")
             return False
     
     async def load_persistent_state(self, channel: str) -> bool:
