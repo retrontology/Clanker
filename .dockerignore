@@ -1,0 +1,98 @@
+# Docker ignore file for Twitch Ollama Chatbot
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Environment and secrets
+.env
+.env.local
+.env.production
+
+# Database files (will be mounted as volumes)
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs (will be mounted as volumes)
+logs/
+*.log
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation build
+docs/_build/
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Deployment configs
+deploy/
+k8s/
+systemd/
+
+# Development tools
+.kiro/
+tests/
+examples/
+docs/
+
+# Large model files (if any)
+*.bin
+*.safetensors
+models/

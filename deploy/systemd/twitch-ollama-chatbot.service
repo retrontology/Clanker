@@ -1,0 +1,55 @@
+[Unit]
+Description=Twitch Ollama Chatbot
+Documentation=https://github.com/your-repo/twitch-ollama-chatbot
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chatbot
+Group=chatbot
+WorkingDirectory=/opt/twitch-ollama-chatbot
+ExecStart=/opt/twitch-ollama-chatbot/venv/bin/python -m chatbot.main
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Restart configuration
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Environment
+Environment=PYTHONPATH=/opt/twitch-ollama-chatbot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/twitch-ollama-chatbot/.env
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/twitch-ollama-chatbot/data /opt/twitch-ollama-chatbot/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=1G
+CPUQuota=50%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twitch-ollama-chatbot
+
+[Install]
+WantedBy=multi-user.target

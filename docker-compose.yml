@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  chatbot:
+    build: .
+    container_name: twitch-ollama-chatbot
+    restart: unless-stopped
+    environment:
+      # Database Configuration
+      - DATABASE_TYPE=sqlite
+      - DATABASE_URL=/app/data/chatbot.db
+      
+      # Ollama Configuration (connect to host Ollama instance)
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=llama3.1
+      - OLLAMA_TIMEOUT=30
+      
+      # Twitch Configuration (set these in .env file)
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_CHANNELS=${TWITCH_CHANNELS}
+      
+      # Content Filtering
+      - CONTENT_FILTER_ENABLED=true
+      - BLOCKED_WORDS_FILE=/app/blocked_words.txt
+      
+      # Logging Configuration
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - LOG_FILE=/app/logs/chatbot.log
+      
+      # Resource Management
+      - MEMORY_WARNING_MB=512
+      - MEMORY_CRITICAL_MB=1024
+      - MESSAGE_RETENTION_DAYS=30
+      - METRICS_RETENTION_DAYS=7
+      - CLEANUP_INTERVAL_MINUTES=60
+    
+    volumes:
+      # Persistent data storage
+      - chatbot_data:/app/data
+      - chatbot_logs:/app/logs
+      # Optional: Mount custom blocked words file
+      # - ./blocked_words.txt:/app/blocked_words.txt:ro
+    
+    # Optional: Connect to external networks
+    # networks:
+    #   - ollama_network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+  # Optional: Include Ollama service in the same compose file
+  # Uncomment if you want to run Ollama in Docker as well
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   environment:
+  #     - OLLAMA_HOST=0.0.0.0
+  #   # Uncomment for GPU support
+  #   # deploy:
+  #   #   resources:
+  #   #     reservations:
+  #   #       devices:
+  #   #         - driver: nvidia
+  #   #           count: 1
+  #   #           capabilities: [gpu]
+
+volumes:
+  chatbot_data:
+    driver: local
+  chatbot_logs:
+    driver: local
+  # ollama_data:
+  #   driver: local
+
+# Optional: Create custom network for service communication
+# networks:
+#   ollama_network:
+#     driver: bridge
