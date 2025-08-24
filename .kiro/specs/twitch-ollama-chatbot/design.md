@@ -31,6 +31,7 @@ graph TB
     
     TwitchIRC <--> IRC
     IRC --> Filter
+    IRC --> Config
     Filter --> DB
     DB --> Ollama
     OllamaAPI <--> Ollama
@@ -64,13 +65,18 @@ The system follows a modular architecture with six core components:
 
 **Key Classes**:
 ```python
-class TwitchIRCClient:
-    async def connect(self, channels: List[str]) -> None
+class TwitchIRCClient(twitchio.Bot):
+    def __init__(self, token: str, bot_username: str, known_bots: List[str], initial_channels: List[str])
+    async def event_ready(self) -> None  # Bot connected and ready
+    async def event_message(self, message: twitchio.Message) -> None  # Handle incoming messages
+    async def event_raw_data(self, data: str) -> None  # Handle raw IRC events (CLEARMSG, CLEARCHAT)
     async def send_message(self, channel: str, message: str) -> None
-    async def handle_message(self, channel: str, user: str, message: str) -> None
+    async def handle_chat_command(self, message: twitchio.Message) -> None  # Process !clank commands
     async def handle_clearmsg(self, channel: str, message_id: str) -> None  # Single message deletion
     async def handle_clearchat_user(self, channel: str, user_id: str) -> None  # User timeout/ban
     async def handle_clearchat_all(self, channel: str) -> None  # Full chat clear
+    def is_bot_message(self, username: str) -> bool  # Check if message is from this bot or other known bots
+    def is_system_message(self, message: twitchio.Message) -> bool  # Check if message is from Twitch system
     
 class MessageEvent:
     channel: str
@@ -79,14 +85,79 @@ class MessageEvent:
     message_id: str
     content: str
     timestamp: datetime
+    badges: Dict[str, str]  # Twitch IRC badges (e.g., {"broadcaster": "1", "moderator": "1"})
+    
+    @classmethod
+    def from_twitchio_message(cls, message: twitchio.Message) -> 'MessageEvent':
+        """Convert TwitchIO message to internal MessageEvent"""
+        return cls(
+            channel=message.channel.name,
+            user_id=message.author.id,
+            user_display_name=message.author.display_name,
+            message_id=message.id,
+            content=message.content,
+            timestamp=datetime.now(),
+            badges=message.author.badges or {}
+        )
 ```
 
 **Responsibilities**:
 - Maintain persistent IRC connections to multiple channels
 - Parse incoming messages and moderation events
+- **Parse Twitch IRC tags** to extract user badges, message IDs, and other metadata
+- **Detect and route chat commands** (e.g., `!clank` commands) to Configuration Manager with user authorization
 - Handle reconnection with exponential backoff
-- Route events to the Message Processor
-- Send generated messages to appropriate channels
+- Route regular messages to the Message Processor
+- Send generated messages and command responses to appropriate channels
+
+**TwitchIO Library Choice**:
+Using TwitchIO (twitchio>=2.0.0) as the IRC library provides:
+- **Automatic tag parsing**: All Twitch IRC metadata automatically parsed into Python objects
+- **Built-in OAuth**: Handles Twitch authentication and token management
+- **Event system**: Clean async event handlers for messages, moderation events, etc.
+- **Rate limiting**: Built-in Twitch rate limit compliance
+- **Reconnection**: Automatic reconnection handling with exponential backoff
+
+**TwitchIO Message Object**:
+```python
+# TwitchIO automatically provides:
+message.author.badges          # Dict of user badges
+message.id                     # Unique message ID
+message.author.id              # User ID for ban tracking
+message.author.display_name    # User's display name
+message.content                # Message text
+message.channel.name           # Channel name
+```
+
+**Message Filtering Logic**:
+Only regular user messages are stored and counted. The following are ignored:
+- **Bot's own messages**: Detected by comparing username to bot's authenticated username
+- **Other chatbots**: Detected using configurable list of known bot usernames (Nightbot, StreamElements, etc.)
+- **System messages**: Twitch notifications for follows, subs, raids, etc. (detected via IRC message type or sender)
+- **Filtered messages**: Messages blocked by content filter are never stored
+
+**Bot Detection Implementation**:
+```python
+def is_bot_message(self, username: str) -> bool:
+    """Check if message should be ignored (from bots)"""
+    username_lower = username.lower()
+    
+    # Check if it's our own bot
+    if username_lower == self.bot_username.lower():
+        return True
+    
+    # Check against known bot list
+    for bot_name in self.known_bots:
+        if username_lower == bot_name.lower():
+            return True
+    
+    return False
+
+def is_system_message(self, message: twitchio.Message) -> bool:
+    """Check if message is from Twitch system using TwitchIO"""
+    # System messages in TwitchIO typically don't have author.id or are special types
+    return message.author is None or message.author.id is None
+```
 
 ### 2. Ollama Client Module
 
@@ -96,9 +167,13 @@ class MessageEvent:
 ```python
 class OllamaClient:
     def __init__(self, base_url: str, timeout: int = 30)
-    async def generate_message(self, model: str, context: List[str], user_input: str = None) -> str
+    async def generate_spontaneous_message(self, model: str, context: List[str]) -> str
+    async def generate_response_message(self, model: str, context: List[str], user_input: str, user_name: str) -> str
     async def validate_model(self, model: str) -> bool
-    def format_context(self, messages: List[Message]) -> str
+    async def list_available_models(self) -> List[str]  # Get all available models from Ollama
+    async def validate_startup_model(self, model: str) -> None  # Raises exception if model unavailable at startup
+    def format_context_for_spontaneous(self, messages: List[Message]) -> str
+    def format_context_for_response(self, messages: List[Message], user_input: str, user_name: str) -> str
     def validate_response(self, response: str) -> str
     
 class GenerationRequest:
@@ -109,22 +184,478 @@ class GenerationRequest:
 ```
 
 **Responsibilities**:
-- Format chat context for Ollama prompts
+- Format chat context for different prompt types (spontaneous vs response)
 - Make HTTP requests to Ollama API with timeout handling
 - Validate and format AI responses
 - Ensure messages comply with 500-character Twitch limit
 - Handle model switching per channel
+- Apply appropriate system prompts based on generation context
 
-**System Prompt**:
+**System Prompts**:
+
+*Spontaneous Message Prompt*:
 ```
 Generate a single casual chat message that fits naturally with the recent conversation. 
-Be conversational and match the tone of recent messages. Keep it under 500 characters 
-and avoid special formatting. Generate only the message content, nothing else.
+Be conversational and match the tone of recent messages. Don't reference specific users 
+or respond to anyone directly - just add to the conversation naturally. Keep it under 
+500 characters and avoid special formatting. Generate only the message content, nothing else.
 ```
+
+*Response Message Prompt*:
+```
+Generate a single casual response to the user's message, considering the recent chat context. 
+Be conversational and match the tone of the chat. Address the user's input naturally but 
+don't be overly formal. Keep it under 500 characters and avoid special formatting. 
+Generate only the response content, nothing else.
+```
+
+## Prompt Engineering Strategy
+
+### Context Formatting Differences
+
+**Spontaneous Message Context**:
+```
+Recent chat messages:
+[User1]: Hey everyone!
+[User2]: what's up
+[User3]: just chilling, you?
+
+Generate a natural chat message that fits the conversation.
+```
+
+**Response Message Context**:
+```
+Recent chat messages:
+[User1]: Hey everyone!
+[User2]: what's up
+[User3]: just chilling, you?
+[BotName]: User3 mentioned you, what do you think about the new game?
+
+Generate a response to User3's message: "just chilling, you?"
+```
+
+### Prompt Selection Logic
+
+```python
+async def generate_message(self, channel: str, is_mention: bool = False, 
+                          user_input: str = None, user_name: str = None) -> str:
+    """Generate appropriate message based on context"""
+    
+    context_messages = await self.db.get_recent_messages(channel, limit=config.context_limit)
+    
+    if is_mention and user_input and user_name:
+        # Use response prompt for mentions
+        return await self.ollama.generate_response_message(
+            model=config.ollama_model,
+            context=context_messages,
+            user_input=user_input,
+            user_name=user_name
+        )
+    else:
+        # Use spontaneous prompt for automatic generation
+        return await self.ollama.generate_spontaneous_message(
+            model=config.ollama_model,
+            context=context_messages
+        )
+```
+
+### Prompt Design Rationale
+
+**Spontaneous Messages**:
+- Focus on natural conversation flow
+- Avoid direct responses to specific users
+- Encourage general chat participation
+- Match the energy and tone of recent messages
+
+**Response Messages**:
+- Acknowledge the specific user and their input
+- Maintain conversational tone (not robotic)
+- Consider both the user's message and recent context
+- Provide relevant, engaging responses
+
+**Common Elements**:
+- 500-character limit for Twitch compliance
+- No special formatting (bold, italics, etc.)
+- Casual, conversational tone
+- Context-aware generation
+
+## Rate Limiting Strategy
+
+### Two Independent Cooldown Systems
+
+**Spontaneous Message Cooldown (Channel-Level)**:
+- Default: 5 minutes (300 seconds)
+- Applies only to automatic message generation
+- Configurable via `!clank spontaneous <seconds>`
+- Tracked per channel in `last_spontaneous_message` timestamp
+- Does NOT affect mention responses
+
+**Response Message Cooldown (Per-User)**:
+- Default: 1 minute (60 seconds) 
+- Applies to mention responses on a per-user basis
+- Configurable per channel via `!clank response <seconds>`
+- Tracked per user per channel in `user_response_cooldowns` table
+- Prevents same user from spamming mentions
+
+### Rate Limiting Logic
+
+```python
+async def should_generate_spontaneous_message(self, channel: str) -> bool:
+    """Check if spontaneous generation should trigger"""
+    config = await self.get_channel_config(channel)
+    
+    # Check message count threshold
+    if config.message_count < config.message_threshold:
+        return False
+    
+    # Check spontaneous cooldown
+    if config.last_spontaneous_message:
+        time_since = datetime.now() - config.last_spontaneous_message
+        if time_since.total_seconds() < config.spontaneous_cooldown:
+            return False
+    
+    # Check adequate context
+    available_messages = await self.db.count_recent_messages(channel)
+    if available_messages < 10:
+        return False
+    
+    return True
+
+async def can_respond_to_mention(self, channel: str, user_id: str) -> bool:
+    """Check if bot can respond to this user's mention"""
+    config = await self.get_channel_config(channel)
+    
+    # Get user's last response time
+    last_response = await self.db.get_user_last_response(channel, user_id)
+    
+    if last_response:
+        time_since = datetime.now() - last_response
+        if time_since.total_seconds() < config.response_cooldown:
+            return False
+    
+    return True
+```
+
+### Configuration Commands (No Rate Limiting)
+
+**Trusted User Commands**:
+- `!clank` commands are only available to broadcasters and moderators
+- No rate limiting applied to configuration commands
+- Trusted users are expected to use commands responsibly
+- Commands provide immediate feedback on configuration changes
+
+### Cooldown Independence
+
+**Key Design Principle**: Spontaneous and response cooldowns are completely independent:
+- Generating a spontaneous message does NOT affect response cooldowns
+- Responding to a mention does NOT affect spontaneous cooldown
+- Each system tracks its own timestamps separately
+- Users can still get responses during spontaneous cooldown periods
+- Bot can still generate spontaneous messages while users are on response cooldown
+
+### Ollama Rate Limiting Assessment
+
+**No Ollama rate limiting needed because**:
+- Bot generates at most one message per channel per cooldown period
+- Multiple channels would generate concurrent requests, but that's expected behavior
+- Ollama timeout (30s default) handles slow responses
+- If Ollama is overloaded, requests will timeout and be skipped gracefully
+- No scenario where bot would spam Ollama with requests
+
+## Configuration Management Strategy
+
+### Two-Tier Configuration System
+
+**Global Configuration (Environment Variables)**:
+- Requires application restart to change
+- Covers infrastructure settings that rarely change
+- Examples: Database connection, Ollama URL, OAuth credentials, default model
+- Simple, reliable, no hot-reloading complexity
+
+**Per-Channel Configuration (Database + Chat Commands)**:
+- Changes take effect immediately via `!clank` commands
+- Covers operational settings that may need tuning
+- Examples: Message thresholds, cooldowns, context limits, channel-specific models
+- Stored in database, persists across restarts
+
+### Configuration Change Workflow
+
+**Global Settings Changes**:
+1. Update environment variables
+2. Restart application
+3. Bot loads new global configuration on startup
+
+**Channel Settings Changes**:
+1. Use `!clank` command in chat (broadcaster/mod only)
+2. Setting updates immediately in database
+3. Bot uses new setting for next operations
+4. No restart required
+
+### Design Rationale
+
+**Why No Hot Reloading for Global Settings**:
+- **Simplicity**: Avoids complex file watching and reload logic
+- **Reliability**: Restart ensures clean state and proper validation
+- **Infrequent changes**: Global settings rarely change in production
+- **Clear boundaries**: Separates infrastructure config from operational config
+- **Future flexibility**: Can add hot reloading later if needed without breaking changes
+
+**Benefits of This Approach**:
+- **Predictable behavior**: Clear distinction between restart-required and immediate changes
+- **Easier debugging**: No complex state management for configuration reloading
+- **Safer operations**: Global changes require intentional restart, preventing accidental disruption
+- **Simpler implementation**: Focus on core functionality rather than configuration complexity
+
+## Logging Strategy
+
+### Log Levels and Events
+
+**INFO Level**:
+- Bot startup and shutdown events
+- Channel connections and disconnections
+- Message generation events (successful)
+- Configuration changes via chat commands
+- Authentication events (successful)
+- Performance milestones (messages processed, uptime)
+
+**WARNING Level**:
+- Ollama API timeouts or slow responses (>10s)
+- Content filtering blocks (with blocked content for analysis)
+- Rate limit hits (user or spontaneous cooldowns)
+- Model validation failures during runtime
+- Database connection issues (before retry)
+- IRC reconnection attempts
+
+**ERROR Level**:
+- Database connection failures
+- Authentication failures
+- Ollama API errors
+- Critical startup failures
+- Unhandled exceptions
+- Configuration validation errors
+
+**DEBUG Level** (Development Only):
+- Individual message processing details
+- Context window building
+- Database query details
+- Detailed Ollama request/response data
+
+### Log Format and Structure
+
+**Production Format (JSON)**:
+```json
+{
+  "timestamp": "2024-01-15T10:30:45.123Z",
+  "level": "INFO",
+  "event_type": "message_generated",
+  "channel": "examplechannel",
+  "user_id": "12345",
+  "user_display_name": "ExampleUser",
+  "message_id": "abc-123-def",
+  "message_content": "hey everyone!",
+  "generation_type": "spontaneous",
+  "response_time_ms": 2500,
+  "model_used": "llama3.1"
+}
+```
+
+**Development Format (Console)**:
+```
+2024-01-15 10:30:45 INFO [examplechannel] Generated spontaneous message (2.5s, llama3.1)
+2024-01-15 10:30:46 WARN [examplechannel] Content filter blocked message from user12345: "inappropriate content here"
+2024-01-15 10:30:47 ERROR Database connection failed, retrying in 2s (attempt 1/3)
+```
+
+### Logging Implementation
+
+```python
+import logging
+import json
+from datetime import datetime
+from typing import Dict, Any
+
+class StructuredLogger:
+    def __init__(self, name: str, level: str = "INFO", format_type: str = "json"):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(getattr(logging, level.upper()))
+        self.format_type = format_type
+        
+        if format_type == "json":
+            handler = logging.StreamHandler()
+            handler.setFormatter(JsonFormatter())
+        else:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(
+                '%(asctime)s %(levelname)s [%(channel)s] %(message)s'
+            ))
+        
+        self.logger.addHandler(handler)
+    
+    def info(self, message: str, **context):
+        self._log("INFO", message, context)
+    
+    def warning(self, message: str, **context):
+        self._log("WARNING", message, context)
+    
+    def error(self, message: str, **context):
+        self._log("ERROR", message, context)
+    
+    def debug(self, message: str, **context):
+        self._log("DEBUG", message, context)
+    
+    def _log(self, level: str, message: str, context: Dict[str, Any]):
+        log_data = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": level,
+            "message": message,
+            **context
+        }
+        
+        if self.format_type == "json":
+            self.logger.log(getattr(logging, level), json.dumps(log_data))
+        else:
+            self.logger.log(getattr(logging, level), message, extra=context)
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return record.getMessage()
+```
+
+### Key Logging Events
+
+**Message Processing**:
+```python
+# Successful generation
+logger.info("Generated spontaneous message", 
+    channel="examplechannel",
+    generation_type="spontaneous",
+    response_time_ms=2500,
+    model_used="llama3.1",
+    context_size=45
+)
+
+# Content filtering
+logger.warning("Content filter blocked message",
+    channel="examplechannel", 
+    user_id="12345",
+    user_display_name="ExampleUser",
+    blocked_content="inappropriate message here",
+    filter_reason="profanity"
+)
+
+# Rate limiting
+logger.warning("User response rate limited",
+    channel="examplechannel",
+    user_id="12345", 
+    user_display_name="ExampleUser",
+    cooldown_remaining_seconds=45
+)
+```
+
+**System Events**:
+```python
+# Startup
+logger.info("Bot started successfully",
+    channels=["channel1", "channel2"],
+    default_model="llama3.1",
+    database_type="sqlite"
+)
+
+# Configuration changes
+logger.info("Channel configuration updated",
+    channel="examplechannel",
+    setting="spontaneous_cooldown",
+    old_value=300,
+    new_value=180,
+    changed_by_user="moderator123"
+)
+
+# Errors
+logger.error("Ollama API request failed",
+    channel="examplechannel",
+    model="llama3.1",
+    error_type="timeout",
+    request_duration_ms=30000
+)
+```
+
+### Log Destinations and Rotation
+
+**Development**:
+- Console output with human-readable format
+- DEBUG level enabled for detailed troubleshooting
+
+**Production**:
+- JSON format for structured logging
+- File output with rotation (daily or size-based)
+- INFO level default, configurable via LOG_LEVEL
+- Optional integration with log aggregation systems
+
+**Log Rotation Configuration**:
+```python
+import logging.handlers
+
+# Rotate daily, keep 30 days
+handler = logging.handlers.TimedRotatingFileHandler(
+    filename='logs/chatbot.log',
+    when='midnight',
+    interval=1,
+    backupCount=30
+)
+```
+
+### Security Considerations
+
+**Safe to Log**:
+- Public chat message content (it's public data)
+- User display names and user IDs
+- Channel names
+- Configuration values (except secrets)
+- Performance metrics
+
+**Never Log**:
+- OAuth tokens or refresh tokens
+- Database passwords
+- API keys or secrets
+- Internal system tokens
+
+**Blocked Content Logging**:
+- Log full blocked content for analysis and filter improvement
+- Include context about why content was blocked
+- Use WARNING level to make blocked content easily searchable
 
 ### 3. Database Layer Module
 
 **Purpose**: Manages all persistent storage operations.
+
+**Database Choice Strategy**:
+- **User-driven selection**: Choice between SQLite and MySQL is entirely up to the end user
+- **Default to SQLite**: If `DATABASE_TYPE` is unset or empty, defaults to SQLite
+- **No auto-detection**: System uses exactly what's configured, no fallback logic
+- **No migration tools**: Users are responsible for data migration if switching database types
+- **Flexible deployment**: Both options use identical schema and operations
+
+**Database Selection Logic**:
+```python
+def create_database_manager(config: Dict[str, str]) -> DatabaseManager:
+    """Create appropriate database manager based on configuration"""
+    db_type = config.get('DATABASE_TYPE', 'sqlite').lower()
+    
+    if db_type == 'mysql':
+        return DatabaseManager(
+            db_type='mysql',
+            host=config['MYSQL_HOST'],
+            port=int(config.get('MYSQL_PORT', 3306)),
+            user=config['MYSQL_USER'],
+            password=config['MYSQL_PASSWORD'],
+            database=config['MYSQL_DATABASE']
+        )
+    else:  # Default to SQLite
+        return DatabaseManager(
+            db_type='sqlite',
+            database_url=config.get('DATABASE_URL', './chatbot.db')
+        )
+```
 
 **Schema Design**:
 ```sql
@@ -146,13 +677,34 @@ CREATE TABLE messages (
 CREATE TABLE channel_config (
     channel TEXT PRIMARY KEY,
     message_threshold INTEGER DEFAULT 30,
-    time_delay INTEGER DEFAULT 300,
+    spontaneous_cooldown INTEGER DEFAULT 300,  -- 5 minutes default for spontaneous messages
+    response_cooldown INTEGER DEFAULT 60,      -- 1 minute default for user response cooldown
     context_limit INTEGER DEFAULT 200,
     ollama_model TEXT,
     message_count INTEGER DEFAULT 0,
-    last_bot_message DATETIME,
+    last_spontaneous_message DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Per-user response cooldowns (channel-specific)
+CREATE TABLE user_response_cooldowns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    last_response_time DATETIME NOT NULL,
+    UNIQUE(channel, user_id),
+    INDEX idx_channel_user (channel, user_id)
+);
+
+-- Performance and monitoring metrics
+CREATE TABLE bot_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    metric_type TEXT NOT NULL, -- 'response_time', 'success_rate', 'error_count'
+    metric_value REAL NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_channel_metric_time (channel, metric_type, timestamp)
 );
 
 -- OAuth token storage
@@ -169,11 +721,12 @@ CREATE TABLE auth_tokens (
 **Key Classes**:
 ```python
 class DatabaseManager:
+    def __init__(self, db_type: str = "sqlite", **connection_params)  # Factory pattern for SQLite/MySQL
     async def store_message(self, message: MessageEvent) -> None
     async def get_recent_messages(self, channel: str, limit: int) -> List[Message]
-    async def delete_message_by_id(self, message_id: str) -> None  # CLEARMSG event
-    async def delete_user_messages(self, channel: str, user_id: str) -> None  # CLEARCHAT user event
-    async def clear_channel_messages(self, channel: str) -> None  # CLEARCHAT all event
+    async def delete_message_by_id(self, message_id: str) -> None  # CLEARMSG event - single message deletion
+    async def delete_user_messages(self, channel: str, user_id: str) -> None  # CLEARCHAT user event - purge all user messages
+    async def clear_channel_messages(self, channel: str) -> None  # CLEARCHAT all event - clear entire channel
     async def cleanup_old_messages(self, channel: str, retention_days: int) -> None
     
 class ChannelConfigManager:
@@ -181,6 +734,19 @@ class ChannelConfigManager:
     async def update_config(self, channel: str, key: str, value: Any) -> None
     async def increment_message_count(self, channel: str) -> int
     async def reset_message_count(self, channel: str) -> None
+    async def update_spontaneous_timestamp(self, channel: str) -> None
+    async def can_generate_spontaneous(self, channel: str) -> bool
+    async def can_respond_to_user(self, channel: str, user_id: str) -> bool
+    async def update_user_response_timestamp(self, channel: str, user_id: str) -> None
+    async def load_persistent_state(self, channel: str) -> None  # Load message count and timestamps on startup
+    async def save_persistent_state(self, channel: str) -> None  # Save state for restart continuity
+
+class MetricsManager:
+    async def record_response_time(self, channel: str, duration: float) -> None
+    async def record_success(self, channel: str) -> None
+    async def record_error(self, channel: str, error_type: str) -> None
+    async def get_performance_stats(self, channel: str, hours: int = 24) -> Dict[str, Any]
+    async def cleanup_old_metrics(self, retention_days: int = 7) -> None
 ```
 
 ### 4. Message Processor Module
@@ -198,9 +764,13 @@ class MessageProcessor:
         # Clean up database when users are banned or messages deleted
     
 class ContentFilter:
-    def filter_input(self, message: str) -> Optional[str]
-    def filter_output(self, message: str) -> Optional[str]
+    def __init__(self, blocked_words_file: str)
+    def filter_input(self, message: str) -> Optional[str]  # Returns None if blocked
+    def filter_output(self, message: str) -> Optional[str]  # Returns None if blocked
     def load_blocked_words(self, file_path: str) -> None
+
+    def is_message_clean(self, message: str) -> bool
+    def normalize_text(self, text: str) -> str  # Handle leetspeak, spacing tricks
     
 # Trigger logic integrated into IRC Handler and Database operations
 # Uses asyncio events to coordinate generation when thresholds are met
@@ -208,11 +778,14 @@ class ContentFilter:
 
 **Message Processing Flow**:
 1. IRC Handler receives message
-2. Content Filter processes message (returns None if blocked)
-3. Database stores filtered message and increments channel message count
-4. Trigger Manager checks count/time thresholds
-5. If triggered: Database provides context → Ollama generates response → IRC Handler sends
-6. Reset message count after successful generation
+2. **If message is a chat command** (starts with `!clank`): Route to Configuration Manager → Send response back through IRC Handler
+3. **If message is from bot or other chatbots**: Ignore completely (don't store or count)
+4. **If message is from system** (raids, follows, subs): Ignore completely (don't store or count)
+5. **If regular user message**: Content Filter processes message (returns None if blocked)
+6. Database stores filtered message and increments channel message count
+7. Trigger Manager checks count/time thresholds
+8. If triggered: Database provides context → Ollama generates response → IRC Handler sends
+9. Reset message count after successful generation (bot's own message is not stored or counted)
 
 ### 5. Configuration Manager Module
 
@@ -221,12 +794,15 @@ class ContentFilter:
 **Key Classes**:
 ```python
 class ConfigurationManager:
-    def __init__(self, db: DatabaseManager)
+    def __init__(self, db: DatabaseManager, auth: AuthenticationManager)
     
     async def process_chat_command(self, channel: str, user: str, command: str) -> str
     async def get_channel_setting(self, channel: str, key: str) -> Any
     async def set_channel_setting(self, channel: str, key: str, value: Any) -> bool
     def validate_setting_value(self, key: str, value: str) -> bool
+    async def validate_model_change(self, model_name: str) -> Tuple[bool, str]  # Returns (success, message)
+    async def check_user_permissions(self, channel: str, user: str, badges: Dict[str, str]) -> bool  # Check if user can modify settings
+    async def is_channel_owner_or_mod(self, badges: Dict[str, str]) -> bool  # Verify authorization from IRC badges
     
 class GlobalConfig:
     ollama_url: str
@@ -237,15 +813,137 @@ class GlobalConfig:
     channels: List[str]
 ```
 
-**Chat Commands**:
+**Chat Commands** (Moderator/Channel Owner Only):
 - `!clank threshold` - Show current message threshold
 - `!clank threshold 45` - Set message threshold to 45
-- `!clank delay` - Show current time delay
-- `!clank delay 300` - Set time delay to 300 seconds
+- `!clank spontaneous` - Show current spontaneous message cooldown
+- `!clank spontaneous 300` - Set spontaneous cooldown to 300 seconds (5 minutes)
+- `!clank response` - Show current response cooldown per user
+- `!clank response 60` - Set response cooldown to 60 seconds (1 minute per user)
 - `!clank context` - Show current context window size
 - `!clank context 150` - Set context window to 150 messages
 - `!clank model` - Show current Ollama model
-- `!clank model llama3.1` - Set Ollama model to llama3.1
+- `!clank model llama3.1` - Set Ollama model to llama3.1 (validates model exists first)
+- `!clank models` - List all available models on the Ollama server
+- `!clank stats` - Show bot performance statistics for the channel
+
+**Authorization Logic**:
+- Commands are only processed for channel owners and moderators
+- Non-authorized users receive no response to prevent chat spam
+- Permission checking uses Twitch IRC badges: `broadcaster/1` for channel owners, `moderator/1` for moderators
+
+**Badge Parsing Implementation**:
+```python
+def is_channel_owner_or_mod(self, badges: Dict[str, str]) -> bool:
+    """Check if user has broadcaster or moderator badges"""
+    return "broadcaster" in badges or "moderator" in badges
+
+def is_channel_owner_or_mod(self, message: twitchio.Message) -> bool:
+    """Check if user has broadcaster or moderator badges using TwitchIO"""
+    badges = message.author.badges or {}
+    return "broadcaster" in badges or "moderator" in badges
+
+# TwitchIO handles badge parsing automatically - no manual parsing needed
+```
+
+## Ollama Model Validation Strategy
+
+### Startup Validation (Fail Fast)
+
+**Critical Path Validation**:
+- Global default model MUST exist on Ollama server at startup
+- If default model is unavailable, application exits gracefully with clear error message
+- Prevents bot from starting in broken state
+
+**Startup Validation Implementation**:
+```python
+async def validate_startup_configuration(self) -> None:
+    """Validate critical configuration at startup"""
+    try:
+        # Test Ollama connection
+        available_models = await self.ollama.list_available_models()
+        
+        # Validate default model exists
+        default_model = self.config.ollama_model
+        if default_model not in available_models:
+            logger.error(
+                f"Default Ollama model '{default_model}' not found on server. "
+                f"Available models: {', '.join(available_models)}"
+            )
+            raise SystemExit(1)
+        
+        logger.info(f"Validated default model '{default_model}' is available")
+        
+    except Exception as e:
+        logger.error(f"Failed to validate Ollama configuration: {e}")
+        raise SystemExit(1)
+```
+
+### Runtime Validation (Graceful Handling)
+
+**Chat Command Model Changes**:
+- Validate model exists before changing channel configuration
+- If model doesn't exist, keep current model and inform user
+- Provide helpful feedback about available models
+
+**Runtime Validation Implementation**:
+```python
+async def handle_model_change_command(self, channel: str, new_model: str) -> str:
+    """Handle !clank model <name> command with validation"""
+    try:
+        # Check if model exists
+        available_models = await self.ollama.list_available_models()
+        
+        if new_model not in available_models:
+            return (
+                f"Model '{new_model}' not found on Ollama server. "
+                f"Available models: {', '.join(available_models[:5])}..."  # Limit for chat
+            )
+        
+        # Model exists, update configuration
+        await self.db.set_channel_setting(channel, 'ollama_model', new_model)
+        return f"Model changed to '{new_model}' for this channel"
+        
+    except Exception as e:
+        logger.error(f"Error validating model change: {e}")
+        return "Error checking model availability. Model unchanged."
+
+async def handle_list_models_command(self) -> str:
+    """Handle !clank models command"""
+    try:
+        available_models = await self.ollama.list_available_models()
+        if not available_models:
+            return "No models available on Ollama server"
+        
+        # Limit response length for Twitch chat
+        model_list = ', '.join(available_models[:8])  # Show first 8 models
+        if len(available_models) > 8:
+            model_list += f" (+{len(available_models) - 8} more)"
+        
+        return f"Available models: {model_list}"
+        
+    except Exception as e:
+        logger.error(f"Error listing models: {e}")
+        return "Error retrieving model list from Ollama server"
+```
+
+### Error Handling Strategy
+
+**Startup Failures**:
+- Log detailed error information
+- Exit with non-zero status code
+- Provide actionable error messages for common issues
+
+**Runtime Failures**:
+- Maintain current configuration
+- Provide user-friendly error messages
+- Log technical details for debugging
+- Never leave bot in broken state
+
+**Model Availability Caching**:
+- Cache model list for short periods (5 minutes) to reduce API calls
+- Refresh cache on validation failures
+- Handle Ollama server restarts gracefully
 
 ### 6. Authentication Manager Module
 
@@ -286,11 +984,12 @@ class Message:
 class ChannelConfig:
     channel: str
     message_threshold: int = 30
-    time_delay: int = 300  # seconds
+    spontaneous_cooldown: int = 300  # seconds (5 minutes default)
+    response_cooldown: int = 60      # seconds (1 minute default per user)
     context_limit: int = 200
     ollama_model: Optional[str] = None
     message_count: int = 0
-    last_bot_message: Optional[datetime] = None
+    last_spontaneous_message: Optional[datetime] = None
 
 @dataclass
 class GenerationContext:
@@ -421,26 +1120,31 @@ OLLAMA_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.1
 OLLAMA_TIMEOUT=30
 
-# Database configuration (SQLite)
-DATABASE_TYPE=sqlite
+# Database configuration
+DATABASE_TYPE=sqlite  # Options: 'sqlite' or 'mysql'. Defaults to 'sqlite' if unset.
+
+# SQLite configuration (default)
 DATABASE_URL=./chatbot.db
 
-# Database configuration (MySQL)
-# DATABASE_TYPE=mysql
-# MYSQL_HOST=localhost
-# MYSQL_PORT=3306
-# MYSQL_USER=chatbot
-# MYSQL_PASSWORD=secure_password
-# MYSQL_DATABASE=twitch_bot
+# MySQL configuration (only required if DATABASE_TYPE=mysql)
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=chatbot
+MYSQL_PASSWORD=secure_password
+MYSQL_DATABASE=twitch_bot
 
 TWITCH_CLIENT_ID=your_client_id
 TWITCH_CLIENT_SECRET=your_client_secret
 TWITCH_CHANNELS=channel1,channel2,channel3
+KNOWN_BOTS=nightbot,streamelements,moobot,fossabot  # Comma-separated list of bot usernames to ignore
 
 CONTENT_FILTER_ENABLED=true
 BLOCKED_WORDS_FILE=./blocked_words.txt
+CONTENT_FILTER_STRICT=false  # If true, blocks more aggressively
 
 LOG_LEVEL=INFO
+LOG_FORMAT=json  # Options: 'json' for production, 'console' for development
+LOG_FILE=./logs/chatbot.log  # Optional: file logging path
 ```
 
 ### Startup Sequence
@@ -448,11 +1152,16 @@ LOG_LEVEL=INFO
 1. Load environment configuration
 2. Initialize database connection and run migrations
 3. Load or refresh OAuth tokens
-4. Connect to Ollama and validate default model
+4. **Connect to Ollama and validate default model (exit if unavailable)**
 5. Connect to Twitch IRC
 6. Join configured channels
 7. Load channel configurations and message history
-8. Start message processing loop
+8. **Restore persistent state**: Load message counts and last bot message timestamps for each channel to maintain continuity across restarts
+9. Initialize performance monitoring and metrics collection
+10. Start message processing loop
+
+**State Persistence Design Rationale**: 
+To meet Requirement 13, the system maintains message counts and timestamps in the database rather than memory. This ensures that if the bot restarts after 25 messages in a channel (with a 30-message threshold), it will continue counting from 25 rather than resetting to 0, providing seamless operation continuity.
 
 ### Graceful Shutdown Handling
 
@@ -527,6 +1236,109 @@ class OllamaClient(ShutdownMixin):
 - Use systemd service for automatic restart
 - Handle SIGTERM/SIGINT signals for graceful shutdown
 
+## Performance Monitoring and Metrics
+
+### Monitoring Strategy
+
+To address Requirement 7, the system implements comprehensive monitoring and performance tracking:
+
+**Key Metrics Tracked**:
+- Response times for Ollama API calls
+- Message generation success/failure rates
+- Database query performance
+- IRC connection stability
+- Content filtering effectiveness
+
+**Metrics Collection**:
+```python
+class PerformanceMonitor:
+    async def track_ollama_request(self, channel: str, start_time: float, success: bool) -> None:
+        duration = time.time() - start_time
+        await self.metrics.record_response_time(channel, duration)
+        if success:
+            await self.metrics.record_success(channel)
+        else:
+            await self.metrics.record_error(channel, "ollama_failure")
+    
+    async def get_channel_stats(self, channel: str) -> Dict[str, Any]:
+        return {
+            "avg_response_time": await self.metrics.get_avg_response_time(channel),
+            "success_rate": await self.metrics.get_success_rate(channel),
+            "messages_generated": await self.metrics.get_generation_count(channel),
+            "uptime": self.get_uptime(),
+            "connection_status": self.irc_client.is_connected()
+        }
+```
+
+**Performance Alerting**:
+- Log warnings when response times exceed 10 seconds
+- Alert on success rates below 90% over 1-hour periods
+- Monitor memory usage and database connection health
+- Track IRC reconnection frequency
+
+**Metrics Retention**:
+- Store detailed metrics for 7 days
+- Aggregate hourly summaries for 30 days
+- Automatic cleanup of old metric data
+
+## Context Window Management
+
+### Edge Case Handling
+
+**Moderation Events During Context Building**:
+- If a user is banned while building a context window, continue with current operation
+- Next context query will automatically exclude deleted messages (database-driven)
+- No special handling needed - database state is always current
+
+**Insufficient Context Scenarios**:
+- **New channels**: Use whatever messages are available, minimum 10 for automatic generation
+- **After cleanup**: Continue with available messages
+- **Low activity**: Wait for more messages before automatic generation
+- **Mention responses**: Always attempt response regardless of context size
+
+**Message Counting and Storage Rules**:
+- **Count and store**: Regular user messages only (after content filtering)
+- **Ignore completely**: Bot messages (own and others), system messages, filtered messages
+- **Reset counter**: Only after successful bot message generation
+- **Persistent counting**: Message counts survive bot restarts via database storage
+
+**Context Window Size Management**:
+```python
+async def build_context_window(self, channel: str) -> List[Message]:
+    """Build context window with proper size limits"""
+    config = await self.get_channel_config(channel)
+    
+    # Get recent messages up to context limit
+    messages = await self.db.get_recent_messages(
+        channel=channel, 
+        limit=config.context_limit
+    )
+    
+    # Always return what's available, even if less than limit
+    return messages
+
+async def should_generate_automatic_message(self, channel: str) -> bool:
+    """Check if automatic generation should trigger"""
+    config = await self.get_channel_config(channel)
+    
+    # Must meet message threshold
+    if config.message_count < config.message_threshold:
+        return False
+    
+    # Must respect time delay
+    if config.last_bot_message:
+        time_since = datetime.now() - config.last_bot_message
+        if time_since.total_seconds() < config.time_delay:
+            return False
+    
+    # Must have minimum context for quality (automatic only)
+    available_messages = await self.db.count_recent_messages(channel)
+    if available_messages < 10:
+        return False
+    
+    return True
+```
+
 ## Security Considerations
 
 ### Token Security
@@ -547,4 +1359,115 @@ class OllamaClient(ShutdownMixin):
 - Implement fail-safe blocking when filters unavailable
 - Respect moderation actions immediately
 
-This design provides a robust, scalable foundation for the Twitch Ollama chatbot that meets all requirements while maintaining clean architecture and security best practices.
+## Content Filtering Implementation
+
+### Filtering Strategy
+
+**Simple Word Blacklist Approach**:
+- Fast, reliable, and easily customizable
+- Case-insensitive matching with normalization
+- Handles common evasion techniques (leetspeak, extra spaces)
+- Separate input and output filtering with same word list
+
+**Filter Implementation**:
+```python
+class ContentFilter:
+    def __init__(self, blocked_words_file: str, strict_mode: bool = False):
+        self.blocked_words = set()
+        self.strict_mode = strict_mode
+        self.load_blocked_words(blocked_words_file)
+    
+    def normalize_text(self, text: str) -> str:
+        """Normalize text to catch evasion attempts"""
+        # Convert to lowercase
+        text = text.lower()
+        # Replace common leetspeak
+        replacements = {'3': 'e', '1': 'i', '0': 'o', '4': 'a', '5': 's', '7': 't'}
+        for num, letter in replacements.items():
+            text = text.replace(num, letter)
+        # Remove extra spaces and special characters
+        text = re.sub(r'[^\w\s]', '', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    def is_message_clean(self, message: str) -> bool:
+        """Check if message contains blocked words"""
+        normalized = self.normalize_text(message)
+        words = normalized.split()
+        
+        # Check individual words
+        for word in words:
+            if word in self.blocked_words:
+                return False
+        
+        # Check substrings if in strict mode
+        if self.strict_mode:
+            for blocked_word in self.blocked_words:
+                if blocked_word in normalized:
+                    return False
+        
+        return True
+    
+    def filter_input(self, message: str) -> Optional[str]:
+        """Filter incoming chat message"""
+        if self.is_message_clean(message):
+            return message
+        return None
+    
+    def filter_output(self, message: str) -> Optional[str]:
+        """Filter bot-generated message"""
+        if self.is_message_clean(message):
+            return message
+        return None
+```
+
+**Blocked Words File Format** (`blocked_words.txt`):
+```
+# Focused blacklist for Twitch chat
+# Allows mild profanity (ass, fuck, shit, etc.) but blocks hate speech and slurs
+# One word per line, case-insensitive
+# Comments start with #
+
+# Racial slurs and hate speech
+# [Specific terms would be listed here - not including examples for obvious reasons]
+
+# Homophobic/transphobic slurs
+# [Specific terms would be listed here]
+
+# Extreme sexual content (beyond normal profanity)
+# [Specific graphic terms that go beyond casual swearing]
+
+# Targeted harassment terms
+# [Terms specifically used for harassment/doxxing]
+
+# Note: Does NOT include mild profanity like:
+# - ass, fuck, shit, damn, hell, bitch (in non-slur context)
+# - These are normal in Twitch chat culture
+```
+
+**Filtering Integration Points**:
+1. **Input filtering**: Before storing messages in database
+2. **Output filtering**: Before sending bot-generated messages
+3. **Fail-safe**: If filtering fails, default to blocking the content
+4. **Logging**: Log blocked content with context for analysis (but don't store the content itself)
+
+**Filtering Philosophy**:
+- **Allow**: Normal Twitch profanity (fuck, shit, ass, damn, etc.)
+- **Block**: Hate speech, slurs, extreme harassment terms
+- **Focus**: Quality of discourse over sanitization
+- **Context-aware**: Same word might be OK in one context, not another
+
+**Customization Options**:
+- `CONTENT_FILTER_STRICT=false`: Default mode, allows mild profanity
+- `CONTENT_FILTER_STRICT=true`: More aggressive, blocks more terms
+- Blocked words file changes require application restart
+- Per-channel word lists (future enhancement)
+- Context-aware filtering (future enhancement)
+
+### Authorization Security
+- Verify user permissions before processing configuration commands
+- Use Twitch IRC badges and channel ownership data for authorization
+- Implement rate limiting on configuration commands to prevent abuse
+- Log all configuration changes with user attribution
+
+This design provides a robust, scalable foundation for the Twitch Ollama chatbot that meets all requirements while maintaining clean architecture, comprehensive monitoring, and security best practices.
