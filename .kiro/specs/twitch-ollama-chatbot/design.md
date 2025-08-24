@@ -1470,4 +1470,380 @@ class ContentFilter:
 - Implement rate limiting on configuration commands to prevent abuse
 - Log all configuration changes with user attribution
 
-This design provides a robust, scalable foundation for the Twitch Ollama chatbot that meets all requirements while maintaining clean architecture, comprehensive monitoring, and security best practices.
+## Error Handling and Resilience
+
+### Ollama Service Resilience
+
+**Extended Ollama Unavailability**:
+- Bot continues normal operation (monitoring, storing messages, processing commands)
+- Message generation is silently skipped when Ollama is unreachable
+- No error messages sent to chat to avoid spam
+- Automatic retry on next generation trigger
+- Status command available for broadcasters/moderators to check Ollama connectivity
+
+**Model Validation Strategy**:
+- **Startup validation**: If global default model is unavailable, application exits gracefully with clear error logging
+- **Runtime model changes**: If user-requested model doesn't exist, command fails with informative message and current model remains unchanged
+- **Model switching**: Validate model availability before applying channel-specific model changes
+
+**Ollama Client Resilience**:
+```python
+class OllamaClient:
+    def __init__(self, base_url: str, timeout: int = 30):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.is_available = True
+        self.last_check = None
+    
+    async def generate_message(self, model: str, context: List[str]) -> Optional[str]:
+        """Generate message with graceful failure handling"""
+        try:
+            # Attempt generation
+            response = await self._make_request(model, context)
+            self.is_available = True
+            return response
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            self.is_available = False
+            logger.warning("Ollama generation failed", 
+                error_type=type(e).__name__,
+                model=model,
+                error_message=str(e)
+            )
+            return None  # Graceful failure - skip generation
+    
+    async def check_health(self) -> bool:
+        """Check if Ollama service is available"""
+        try:
+            response = await self._make_health_request()
+            self.is_available = True
+            return True
+        except Exception:
+            self.is_available = False
+            return False
+    
+    async def validate_startup_model(self, model: str) -> None:
+        """Validate default model at startup - raises exception if unavailable"""
+        try:
+            models = await self.list_available_models()
+            if model not in models:
+                raise RuntimeError(f"Default model '{model}' not available in Ollama. Available models: {models}")
+        except Exception as e:
+            raise RuntimeError(f"Cannot connect to Ollama service at startup: {e}")
+```
+
+### Database Connection Resilience
+
+**Connection Failure Handling**:
+- Pause message processing when database is unavailable
+- Implement exponential backoff for reconnection attempts (max 5 minutes between attempts)
+- Log connection failures and retry attempts
+- Continue IRC monitoring but skip storage operations
+- Resume normal operation when database connectivity is restored
+
+**Partial Database Failures**:
+- If reads work but writes fail: Continue monitoring, skip message storage, log errors
+- If writes work but reads fail: Store messages but skip generation (no context available)
+- Implement connection health checks before critical operations
+
+**Database Manager Resilience**:
+```python
+class DatabaseManager:
+    def __init__(self, db_type: str = "sqlite", **connection_params):
+        self.db_type = db_type
+        self.connection_params = connection_params
+        self.is_connected = False
+        self.retry_count = 0
+        self.max_retry_delay = 300  # 5 minutes max
+    
+    async def store_message(self, message: MessageEvent) -> bool:
+        """Store message with connection retry logic"""
+        if not self.is_connected:
+            if not await self._attempt_reconnection():
+                return False
+        
+        try:
+            await self._execute_store(message)
+            return True
+        except Exception as e:
+            logger.error("Database write failed", 
+                error_type=type(e).__name__,
+                channel=message.channel,
+                error_message=str(e)
+            )
+            self.is_connected = False
+            return False
+    
+    async def _attempt_reconnection(self) -> bool:
+        """Attempt database reconnection with exponential backoff"""
+        delay = min(2 ** self.retry_count, self.max_retry_delay)
+        await asyncio.sleep(delay)
+        
+        try:
+            await self._connect()
+            self.is_connected = True
+            self.retry_count = 0
+            logger.info("Database reconnection successful")
+            return True
+        except Exception as e:
+            self.retry_count += 1
+            logger.warning("Database reconnection failed", 
+                attempt=self.retry_count,
+                next_retry_delay=min(2 ** self.retry_count, self.max_retry_delay),
+                error_message=str(e)
+            )
+            return False
+```
+
+### IRC Connection Resilience
+
+**Persistent Reconnection**:
+- Attempt reconnection indefinitely with exponential backoff
+- Maximum delay between attempts: 5 minutes
+- Reset backoff delay on successful connection
+- Continue attempting to rejoin all configured channels
+- Respect moderation actions (don't rejoin channels that banned the bot)
+
+**TwitchIO Reconnection Enhancement**:
+```python
+class TwitchIRCClient(twitchio.Bot):
+    def __init__(self, token: str, bot_username: str, known_bots: List[str], initial_channels: List[str]):
+        super().__init__(token=token, initial_channels=initial_channels)
+        self.bot_username = bot_username
+        self.known_bots = known_bots
+        self.reconnect_attempts = 0
+        self.max_reconnect_delay = 300  # 5 minutes
+        self.banned_channels = set()  # Track channels that banned the bot
+    
+    async def event_ready(self):
+        """Reset reconnection counter on successful connection"""
+        self.reconnect_attempts = 0
+        logger.info("IRC connection established", 
+            channels=len(self.connected_channels),
+            bot_username=self.bot_username
+        )
+    
+    async def event_channel_joined(self, channel):
+        """Track successful channel joins"""
+        logger.info("Joined channel", channel=channel.name)
+        # Remove from banned list if we successfully rejoined
+        self.banned_channels.discard(channel.name)
+    
+    async def handle_ban_event(self, channel: str):
+        """Handle bot being banned from a channel"""
+        self.banned_channels.add(channel)
+        logger.warning("Bot banned from channel", channel=channel)
+        # Don't attempt to rejoin banned channels
+    
+    async def reconnect_with_backoff(self):
+        """Custom reconnection logic with indefinite attempts"""
+        while True:
+            try:
+                delay = min(2 ** self.reconnect_attempts, self.max_reconnect_delay)
+                logger.info("Attempting IRC reconnection", 
+                    attempt=self.reconnect_attempts + 1,
+                    delay_seconds=delay
+                )
+                await asyncio.sleep(delay)
+                
+                await self.connect()
+                break  # Success - exit retry loop
+                
+            except Exception as e:
+                self.reconnect_attempts += 1
+                logger.warning("IRC reconnection failed", 
+                    attempt=self.reconnect_attempts,
+                    error_message=str(e),
+                    next_delay=min(2 ** self.reconnect_attempts, self.max_reconnect_delay)
+                )
+```
+
+### Authentication Token Resilience
+
+**Token Refresh Handling**:
+- Attempt automatic token refresh when tokens expire
+- If refresh fails, attempt one retry with exponential backoff
+- If both refresh attempts fail, gracefully shut down with clear error logging
+- Log authentication events for monitoring
+
+**Authentication Manager Resilience**:
+```python
+class AuthenticationManager:
+    def __init__(self, client_id: str, client_secret: str, db: DatabaseManager):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.db = db
+        self.refresh_attempted = False
+    
+    async def ensure_valid_token(self) -> Optional[str]:
+        """Ensure we have a valid access token"""
+        token_data = await self.db.get_auth_tokens()
+        
+        if not token_data:
+            logger.error("No authentication tokens found")
+            return None
+        
+        if self._is_token_expired(token_data):
+            return await self._refresh_token(token_data)
+        
+        return token_data.access_token
+    
+    async def _refresh_token(self, token_data) -> Optional[str]:
+        """Attempt token refresh with retry logic"""
+        if self.refresh_attempted:
+            logger.error("Token refresh already attempted and failed, shutting down")
+            return None
+        
+        try:
+            new_tokens = await self._make_refresh_request(token_data.refresh_token)
+            await self.db.update_auth_tokens(new_tokens)
+            logger.info("Authentication token refreshed successfully")
+            return new_tokens.access_token
+            
+        except Exception as e:
+            self.refresh_attempted = True
+            logger.error("Token refresh failed", 
+                error_message=str(e),
+                action="graceful_shutdown_required"
+            )
+            return None
+```
+
+### Resource Exhaustion Protection
+
+**Memory Management**:
+- Implement automatic cleanup of old messages (configurable retention period)
+- Set maximum in-memory cache sizes for frequently accessed data
+- Monitor memory usage and trigger cleanup when thresholds are exceeded
+- Use generators for large data processing operations
+
+**Disk Space Protection (SQLite)**:
+- Monitor database file size and available disk space
+- Implement automatic cleanup when disk usage exceeds thresholds
+- Log disk space warnings before critical levels
+
+**Connection Pool Management (MySQL)**:
+- Set reasonable connection pool limits
+- Implement connection timeout and cleanup
+- Monitor active connections and log pool exhaustion warnings
+
+**Resource Manager Implementation**:
+```python
+class ResourceManager:
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.memory_threshold_mb = 500  # 500MB memory limit
+        self.disk_threshold_percent = 90  # 90% disk usage limit
+        self.cleanup_interval = 3600  # 1 hour cleanup cycle
+    
+    async def monitor_resources(self):
+        """Periodic resource monitoring and cleanup"""
+        while True:
+            try:
+                await self._check_memory_usage()
+                await self._check_disk_usage()
+                await self._cleanup_old_data()
+                await asyncio.sleep(self.cleanup_interval)
+            except Exception as e:
+                logger.error("Resource monitoring failed", error_message=str(e))
+    
+    async def _cleanup_old_data(self):
+        """Clean up old messages and metrics"""
+        # Clean messages older than 7 days
+        await self.db.cleanup_old_messages(retention_days=7)
+        # Clean metrics older than 30 days
+        await self.db.cleanup_old_metrics(retention_days=30)
+```
+
+### Content Filter Resilience
+
+**Filter Failure Handling**:
+- Default to blocking messages when content filter fails
+- Log filter failures for investigation
+- Attempt to reload filter configuration on failure
+- Continue operation with basic keyword blocking if advanced filtering fails
+
+**Fail-Safe Content Filtering**:
+```python
+class ContentFilter:
+    def __init__(self, blocked_words_file: str):
+        self.blocked_words_file = blocked_words_file
+        self.blocked_words = set()
+        self.filter_available = True
+        self.load_blocked_words(blocked_words_file)
+    
+    def filter_input(self, message: str) -> Optional[str]:
+        """Filter input with fail-safe behavior"""
+        try:
+            if not self.filter_available:
+                # Basic fallback filtering
+                return self._basic_filter(message)
+            
+            return self._advanced_filter(message)
+            
+        except Exception as e:
+            logger.error("Content filter failed", 
+                error_message=str(e),
+                message_preview=message[:50]
+            )
+            # Fail-safe: block message when filter fails
+            return None
+    
+    def _basic_filter(self, message: str) -> Optional[str]:
+        """Basic keyword blocking when advanced filter fails"""
+        message_lower = message.lower()
+        for word in self.blocked_words:
+            if word in message_lower:
+                return None
+        return message
+```
+
+### Status Monitoring Commands
+
+**Ollama Status Command**:
+- `!clank status` - Show Ollama connectivity, current model, and recent performance
+- Available to broadcasters and moderators
+- Provides actionable information about system health
+
+**Status Command Implementation**:
+```python
+async def handle_status_command(self, channel: str, user: str, badges: Dict[str, str]) -> str:
+    """Handle !clank status command"""
+    if not self.is_channel_owner_or_mod(badges):
+        return "Only broadcasters and moderators can check bot status."
+    
+    # Check Ollama connectivity
+    ollama_status = "✅ Connected" if await self.ollama.check_health() else "❌ Unavailable"
+    
+    # Get current model
+    config = await self.db.get_channel_config(channel)
+    current_model = config.ollama_model or self.global_config.ollama_model
+    
+    # Get recent performance stats
+    stats = await self.db.get_performance_stats(channel, hours=1)
+    avg_response_time = stats.get('avg_response_time', 0)
+    success_rate = stats.get('success_rate', 100)
+    
+    return (f"🤖 Bot Status | Ollama: {ollama_status} | "
+            f"Model: {current_model} | "
+            f"Avg Response: {avg_response_time:.1f}s | "
+            f"Success Rate: {success_rate:.1f}%")
+```
+
+### Graceful Degradation Summary
+
+**System Behavior During Failures**:
+- **Ollama down**: Continue monitoring, skip generation, provide status via commands
+- **Database down**: Pause processing, attempt reconnection, resume when restored
+- **IRC disconnected**: Reconnect indefinitely, respect bans, restore full functionality
+- **Auth tokens expired**: Attempt refresh once, shutdown gracefully if refresh fails
+- **Content filter failed**: Default to blocking, use basic fallback filtering
+- **Resource exhaustion**: Trigger cleanup, log warnings, maintain core functionality
+
+**Key Principles**:
+- Never spam chat with error messages
+- Maintain core monitoring functionality when possible
+- Provide status information via commands for troubleshooting
+- Log all failures with appropriate detail for debugging
+- Implement fail-safe defaults that prioritize safety over functionality
+
+This design provides a robust, scalable foundation for the Twitch Ollama chatbot that meets all requirements while maintaining clean architecture, comprehensive monitoring, security best practices, and comprehensive error resilience.
