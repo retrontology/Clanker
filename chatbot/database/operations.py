@@ -17,6 +17,7 @@ import time
 
 from .models import Message, MessageEvent, ChannelConfig, UserResponseCooldown, BotMetric, AuthToken
 from .migrations import DatabaseMigrations
+from .resilience import ResilientDatabaseManager, ConnectionHealthMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,18 @@ class DatabaseManager:
         self.connection_params = connection_params
         self.connection_pool = None
         self._retry_count = 0
-        self._max_retries = 3
+        self._max_retries = 5  # Increased from 3 for better resilience
         self._retry_delay = 1.0  # Start with 1 second delay
+        
+        # Connection health monitoring
+        self.health_monitor = ConnectionHealthMonitor(
+            max_retries=self._max_retries,
+            base_delay=self._retry_delay,
+            max_delay=60.0
+        )
+        self._connection_healthy = True
+        self._last_health_check = datetime.now()
+        self._health_check_interval = 30.0  # seconds
         
         # Initialize database schema
         self.migrations = DatabaseMigrations(db_type, connection_params)
@@ -136,11 +147,20 @@ class DatabaseManager:
         self._retry_count += 1
         
         if self._retry_count <= self._max_retries:
-            delay = self._retry_delay * (2 ** (self._retry_count - 1))
-            logger.warning(f"Database connection failed, retrying in {delay}s (attempt {self._retry_count}/{self._max_retries})")
+            # Enhanced exponential backoff with jitter and maximum delay cap
+            base_delay = self._retry_delay * (2 ** (self._retry_count - 1))
+            max_delay = 60.0  # Cap at 60 seconds
+            delay = min(base_delay, max_delay)
+            
+            # Add jitter (±20%) to prevent thundering herd
+            import random
+            jitter = delay * 0.2 * (random.random() - 0.5)
+            delay = max(0, delay + jitter)
+            
+            logger.warning(f"Database connection failed, retrying in {delay:.2f}s (attempt {self._retry_count}/{self._max_retries}): {error}")
             await asyncio.sleep(delay)
         else:
-            logger.error(f"Database connection failed after {self._max_retries} attempts")
+            logger.error(f"Database connection failed after {self._max_retries} attempts: {error}")
             self._retry_count = 0  # Reset for next operation
     
     async def store_message(self, message_event: MessageEvent) -> bool:
@@ -452,22 +472,153 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Failed to fetch query results: {e}")
             return []
+    
+    async def health_check(self) -> bool:
+        """
+        Perform a health check on the database connection.
+        
+        Returns:
+            bool: True if connection is healthy, False otherwise
+        """
+        try:
+            # Simple query to test connection
+            result = await self.fetch_all("SELECT 1 as health_check")
+            is_healthy = len(result) > 0 and result[0].get('health_check') == 1
+            
+            if is_healthy:
+                self.health_monitor.record_success()
+                self._connection_healthy = True
+            else:
+                self.health_monitor.record_failure(Exception("Health check query failed"), "health_check")
+                self._connection_healthy = False
+            
+            self._last_health_check = datetime.now()
+            return is_healthy
+            
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
+            self.health_monitor.record_failure(e, "health_check")
+            self._connection_healthy = False
+            self._last_health_check = datetime.now()
+            return False
+    
+    async def is_connection_healthy(self) -> bool:
+        """
+        Check if connection is healthy, performing health check if needed.
+        
+        Returns:
+            bool: True if connection is healthy, False otherwise
+        """
+        now = datetime.now()
+        time_since_check = (now - self._last_health_check).total_seconds()
+        
+        # Perform health check if interval has passed
+        if time_since_check >= self._health_check_interval:
+            return await self.health_check()
+        
+        return self._connection_healthy
+    
+    async def get_connection_status(self) -> Dict[str, Any]:
+        """
+        Get detailed connection status information.
+        
+        Returns:
+            Dict containing connection status details
+        """
+        status = {
+            'db_type': self.db_type,
+            'connection_healthy': self._connection_healthy,
+            'last_health_check': self._last_health_check.isoformat(),
+            'health_check_interval': self._health_check_interval,
+            'retry_count': self._retry_count,
+            'max_retries': self._max_retries,
+        }
+        
+        # Add health monitor status
+        status.update(self.health_monitor.get_health_status())
+        
+        return status
+    
+    async def handle_partial_failure(self, operation_type: str, error: Exception) -> bool:
+        """
+        Handle partial database failures gracefully.
+        
+        Args:
+            operation_type: Type of operation (read/write)
+            error: The exception that occurred
+            
+        Returns:
+            bool: True if operation can continue in degraded mode, False otherwise
+        """
+        error_str = str(error).lower()
+        
+        # Check for read-only mode
+        if any(indicator in error_str for indicator in [
+            'read-only', 'readonly', 'read only',
+            'database is locked', 'disk full'
+        ]):
+            logger.warning(f"Database in read-only mode, {operation_type} operations may fail")
+            
+            # Allow read operations in read-only mode
+            if operation_type.lower() in ['read', 'select', 'query', 'fetch']:
+                return True
+            else:
+                logger.error(f"Cannot perform {operation_type} operation in read-only mode")
+                return False
+        
+        # Check for connection issues
+        if any(indicator in error_str for indicator in [
+            'connection', 'network', 'timeout', 'unreachable'
+        ]):
+            logger.warning(f"Database connection issues detected for {operation_type} operation")
+            return False
+        
+        # Default to allowing degraded operation for reads, blocking writes
+        if operation_type.lower() in ['read', 'select', 'query', 'fetch']:
+            logger.warning(f"Allowing degraded {operation_type} operation despite error: {error}")
+            return True
+        else:
+            logger.error(f"Blocking {operation_type} operation due to error: {error}")
+            return False
+    
+    async def start_background_monitoring(self):
+        """Start background health monitoring task."""
+        asyncio.create_task(self._background_health_monitor())
+    
+    async def _background_health_monitor(self):
+        """Background task for continuous health monitoring."""
+        while True:
+            try:
+                await asyncio.sleep(self._health_check_interval)
+                
+                # Perform health check
+                is_healthy = await self.health_check()
+                
+                # Log status if unhealthy
+                if not is_healthy:
+                    status = await self.get_connection_status()
+                    logger.warning(f"Database health check failed: {status}")
+                
+            except Exception as e:
+                logger.error(f"Background health monitoring error: {e}")
+                await asyncio.sleep(5)  # Short delay before retrying
 
 
-def create_database_manager(config: Dict[str, str]) -> DatabaseManager:
+def create_database_manager(config: Dict[str, str], enable_resilience: bool = True) -> Union[DatabaseManager, ResilientDatabaseManager]:
     """
     Create appropriate database manager based on configuration.
     
     Args:
         config: Configuration dictionary with database settings
+        enable_resilience: Whether to wrap with resilience features
         
     Returns:
-        DatabaseManager instance
+        DatabaseManager or ResilientDatabaseManager instance
     """
     db_type = config.get('DATABASE_TYPE', 'sqlite').lower()
     
     if db_type == 'mysql':
-        return DatabaseManager(
+        base_manager = DatabaseManager(
             db_type='mysql',
             host=config['MYSQL_HOST'],
             port=int(config.get('MYSQL_PORT', 3306)),
@@ -476,10 +627,16 @@ def create_database_manager(config: Dict[str, str]) -> DatabaseManager:
             database=config['MYSQL_DATABASE']
         )
     else:  # Default to SQLite
-        return DatabaseManager(
+        base_manager = DatabaseManager(
             db_type='sqlite',
             database_url=config.get('DATABASE_URL', './chatbot.db')
         )
+    
+    # Wrap with resilience features if enabled
+    if enable_resilience:
+        return ResilientDatabaseManager(base_manager)
+    else:
+        return base_manager
 
 
 class ChannelConfigManager:
