@@ -831,6 +831,118 @@ class ChannelConfigManager:
             
         except Exception as e:
             logger.error(f"Failed to save persistent state for {channel}: {e}")
+    
+    async def update_user_response_timestamp(self, channel: str, user_id: str) -> bool:
+        """
+        Update user's response timestamp for rate limiting.
+        
+        Args:
+            channel: Channel name
+            user_id: User ID
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            now = datetime.now()
+            
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO user_response_cooldowns 
+                        (channel, user_id, last_response_time) 
+                        VALUES (?, ?, ?)
+                    """, (channel, user_id, now))
+                    conn.commit()
+                    
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("""
+                        INSERT INTO user_response_cooldowns 
+                        (channel, user_id, last_response_time) 
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE last_response_time = %s
+                    """, (channel, user_id, now, now))
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to update user response timestamp for {user_id} in {channel}: {e}")
+            return False
+    
+    async def get_user_last_response(self, channel: str, user_id: str) -> Optional[datetime]:
+        """
+        Get user's last response time.
+        
+        Args:
+            channel: Channel name
+            user_id: User ID
+            
+        Returns:
+            Last response datetime or None if never responded
+        """
+        try:
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("""
+                        SELECT last_response_time FROM user_response_cooldowns 
+                        WHERE channel = ? AND user_id = ?
+                    """, (channel, user_id))
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("""
+                        SELECT last_response_time FROM user_response_cooldowns 
+                        WHERE channel = %s AND user_id = %s
+                    """, (channel, user_id))
+                
+                result = cursor.fetchone()
+                if result:
+                    return result[0] if isinstance(result[0], datetime) else datetime.fromisoformat(str(result[0]))
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to get user last response for {user_id} in {channel}: {e}")
+            return None
+    
+    async def cleanup_old_user_cooldowns(self, days: int = 30) -> bool:
+        """
+        Clean up old user response cooldown records.
+        
+        Args:
+            days: Number of days to retain cooldown records
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            
+            async with self.db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                if self.db_manager.db_type == 'sqlite':
+                    cursor.execute("""
+                        DELETE FROM user_response_cooldowns 
+                        WHERE last_response_time < ?
+                    """, (cutoff_date,))
+                    conn.commit()
+                    deleted_count = cursor.rowcount
+                    
+                elif self.db_manager.db_type == 'mysql':
+                    cursor.execute("""
+                        DELETE FROM user_response_cooldowns 
+                        WHERE last_response_time < %s
+                    """, (cutoff_date,))
+                    deleted_count = cursor.rowcount
+                
+                logger.info(f"Cleaned up {deleted_count} old user cooldown records (older than {days} days)")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to cleanup old user cooldowns: {e}")
+            return False
 
 
 class AuthTokenManager:
