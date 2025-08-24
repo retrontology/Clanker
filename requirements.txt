@@ -30,6 +30,9 @@ asyncio-mqtt>=0.13.0
 # Logging and monitoring
 structlog>=23.0.0
 
+# System monitoring and resource management
+psutil>=5.9.0
+
 # Development and testing dependencies (optional)
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
